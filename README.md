@@ -92,4 +92,5 @@ SELECT pivot_ext_pkg.convert_sql(Q'{select * from  HR.COUNTRIES
 
 ## 其他
 由于oracle的sql语法解析相当复杂,本功能只是对关键字' for '来对字符串进行识别,检索出对应的子查询并将子查询的结果替换掉原有的子查询sql,如果sql中有使用unpivot,或者存在和关键字一样的字符串常量,此功能会报错,以后会再看unpivot的for是否也可以进行类似的转换。
+另外,转换的列名以子查询本身的值为准,不支持自定义别名,如果数据超长则查询失败。
 除了上面提到的问题,如有用户测试报错,请联系作者或者在github上发issue
