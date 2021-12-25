@@ -4,7 +4,7 @@
 https://github.com/Dark-Athena/pivot_ext_pkg-oracle
 
 ## 背景
-众所周知,oracle的原生pivot功能,无法在"for ... in ()" 的括号中使用子查询,
+众所周知,oracle的原生pivot功能,无法在"for ... in ()" 的括号中使用子查询(不使用xml的情况下),
 比如,如果执行
 
 ```sql
