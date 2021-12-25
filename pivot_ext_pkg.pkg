@@ -1,0 +1,431 @@
+create or replace package pivot_ext_pkg is
+ -- Author  : DarkAthena (darkathena@qq.com)                
+  -- Created : 2021/12/25 15:42:29
+  -- Purpose : TO SOLVE PIVOT (WITHOUT XML) CAN'T USE "IN (SELECT )"
+  -- memo    : 1. 19c and  21c test ok
+  --           2. PROCEDURE "export_data_xform_query" is COPYING from ORACLE 19C DBMS_CLOUD PKG,
+  --              AND ORACLE COMPANY HAS Copyright WITH THIS PROCEDURE
+  /*
+  Copyright DarkAthena(darkathena@qq.com)
+  
+     Licensed under the Apache License, Version 2.0 (the "License");
+     you may not use this file except in compliance with the License.
+     You may obtain a copy of the License at
+  
+         http://www.apache.org/licenses/LICENSE-2.0
+  
+     Unless required by applicable law or agreed to in writing, software
+     distributed under the License is distributed on an "AS IS" BASIS,
+     WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+     See the License for the specific language governing permissions and
+     limitations under the License.
+  */ 
+ type ref_cur is ref cursor;
+  TYPE OUT_DATA IS TABLE OF VARCHAR2(32000);
+  FORMAT_TYPE_CSV   CONSTANT DBMS_ID := 'CSV';
+  FORMAT_TYPE_JSON  CONSTANT DBMS_ID := 'JSON';
+  FORMAT_TYPE_TEXT  CONSTANT DBMS_ID := 'TXT';
+  FORMAT_TYPE_XML   CONSTANT DBMS_ID := 'XML';
+  FORMAT_TRIM_LTRIM CONSTANT DBMS_ID := 'LTRIM';
+  FORMAT_TRIM_RTRIM CONSTANT DBMS_ID := 'RTRIM';
+  /*CONVERT A SQL( PIVOT (FOR ... IN (SELECT ...)) TO A correct SQL
+  SELECT pivot_ext_pkg.convert_sql(Q'{select * from  HR.COUNTRIES
+                                          pivot(MAX(COUNTRY_NAME) for COUNTRY_ID in(
+                                           select distinct COUNTRY_ID from  HR.COUNTRIES  ))}') FROM DUAL;
+  */
+  function convert_sql(l_main_Sql clob) return clob;
+  /*GET A CURSOR BY USING A SQL( PIVOT (FOR ... IN (SELECT ...))
+  SELECT pivot_ext_pkg.get_cursor(Q'{select * from  HR.COUNTRIES
+                                          pivot(MAX(COUNTRY_NAME) for COUNTRY_ID in(
+                                           select distinct COUNTRY_ID from  HR.COUNTRIES  ))}') FROM DUAL;
+  */
+  function get_cursor(i_sql clob) return ref_cur;
+  /*GET DATA BY USING A SQL( PIVOT (FOR ... IN (SELECT ...))
+  
+  EXP 1 SIMPLE
+  select * from pivot_ext_pkg.GET_DATA(i_sql           => Q'{select * from  HR.COUNTRIES
+                                          pivot(MAX(COUNTRY_NAME) for COUNTRY_ID in(
+                                           select distinct COUNTRY_ID from  HR.COUNTRIES  ))}'); 
+  
+  EXP 2  DEFINE FORMAT TYPE AND field_delimiter  ,AND SHOW THE COLUMN's NAME                                      
+  select * from pivot_ext_pkg.GET_DATA(i_sql           => Q'{select * from  HR.COUNTRIES
+                                          pivot(MAX(COUNTRY_NAME) for COUNTRY_ID in(
+                                           select distinct COUNTRY_ID from  HR.COUNTRIES  ))}',
+                   format          => 'CSV',
+                   field_delimiter => ',',
+                   skip_header     => 'N');
+  EXP 3 FORMAT BY JSON
+ select * from pivot_ext_pkg.GET_DATA(i_sql           => Q'{select * from  HR.COUNTRIES
+                                          pivot(MAX(COUNTRY_NAME) for COUNTRY_ID in(
+                                           select distinct COUNTRY_ID from  HR.COUNTRIES  ))}',
+                   format          => 'JSON');                  
+  EXP 4 FORMAT BY XML
+ select * from pivot_ext_pkg.GET_DATA(i_sql           => Q'{select * from  HR.COUNTRIES
+                                          pivot(MAX(COUNTRY_NAME) for COUNTRY_ID in(
+                                           select distinct COUNTRY_ID from  HR.COUNTRIES  ))}',
+                   format          => 'XML');                
+  */
+  FUNCTION GET_DATA(i_sql           clob,
+                    format          varchar2 default FORMAT_TYPE_CSV,
+                    field_delimiter VARCHAR2 DEFAULT ',',
+                    skip_header     varchar2 default 'Y') RETURN OUT_DATA
+    PIPELINED;
+end pivot_ext_pkg;
+/
+create or replace package body pivot_ext_pkg is
+  M_VCSIZ_4K  CONSTANT PLS_INTEGER := 4000;
+  M_VCSIZ_32K CONSTANT PLS_INTEGER := 32767;
+  invalid_format_value EXCEPTION;
+  function convert_listagg_sql(query IN CLOB) return CLOB IS
+    l_query CLOB;
+    l_cur   INTEGER;
+    l_ncols INTEGER;
+    l_desc  DBMS_SQL.desc_tab2;
+  BEGIN
+  
+    l_query := query;
+  
+    BEGIN
+      l_cur := DBMS_SQL.open_cursor;
+      DBMS_SQL.parse(l_cur, l_query, DBMS_SQL.native);
+      DBMS_SQL.describe_columns2(l_cur, l_ncols, l_desc);
+      DBMS_SQL.close_cursor(l_cur);
+    EXCEPTION
+      WHEN OTHERS THEN
+        DBMS_SQL.close_cursor(l_cur);
+       Raise_application_error(-20000, SQLERRM);
+    END;
+  
+    l_query := q'{select listagg(''''||}' || l_desc(1).col_name ||
+               q'{ ||''' '||'"'||}' || l_desc(1).col_name ||
+               q'{ ||'"',',') }';
+  
+    l_query := l_query || 'FROM (' || query || ')';
+  
+    return l_query;
+  END;
+  function convert_sql(l_main_Sql clob) return clob is
+    l_in_str       varchar2(4000);
+    l_out_sql      clob;
+    l_for_count    number;
+    l_sql_1        clob;
+    l_for_ind      varchar2(10) := ' FOR ';
+    L_for_pos      number;
+    l_for_pos_from number;
+    l_for_pos_end  number;
+    l_left_count   number;
+    l_pivot_in_sql dbms_sql.Clob_Table;
+  begin
+    l_sql_1 := replace(l_main_Sql, chr(13), ' ');
+    l_sql_1 := replace(l_sql_1, chr(10), ' ');
+    l_sql_1 := upper(l_sql_1);
+    SELECT REGEXP_COUNT(l_sql_1, l_for_ind) into l_for_count FROM DUAL;
+  
+    if l_for_count > 0 then
+      for i in 1 .. l_for_count loop
+        SELECT instr(l_sql_1, l_for_ind, 1, i) INTO L_for_pos FROM DUAL;
+        l_left_count   := 0;
+        l_for_pos_from := 0;
+        for j in L_for_pos .. length(l_sql_1) loop
+          if substr(l_sql_1, j, 1) = '(' then
+            if l_left_count = 0 then
+              l_for_pos_from := j;
+            end if;
+            l_left_count := l_left_count + 1;
+          
+          elsif substr(l_sql_1, j, 1) = ')' then
+            l_left_count := l_left_count - 1;
+          end if;
+          if l_left_count = 0 and l_for_pos_from > 0 then
+            l_for_pos_end := j;
+            exit;
+          end if;
+        end loop;
+        l_pivot_in_sql(i) := substr(l_main_Sql,
+                                    l_for_pos_from + 1,
+                                    l_for_pos_end - l_for_pos_from - 1);
+      end loop;
+    end if;
+    for i in 1 .. l_pivot_in_sql.count loop
+      execute immediate convert_listagg_sql(l_pivot_in_sql(i))
+        into l_in_str;
+      l_out_sql := replace(l_main_Sql, l_pivot_in_sql(i), l_in_str);
+    end loop;
+    return l_out_sql;
+  end;
+  function get_cursor(i_sql clob) return ref_cur is
+    rc ref_cur;
+  begin
+    open rc for convert_sql(i_sql);
+    return rc;
+  end;
+  PROCEDURE export_data_xform_query(format_type     IN VARCHAR2,
+                                    row_size        IN VARCHAR2 DEFAULT NULL,
+                                    field_delimiter IN VARCHAR2,
+                                    trim_spaces     IN VARCHAR2 DEFAULT NULL,
+                                    quote           IN VARCHAR2 DEFAULT NULL,
+                                    end_quote       IN VARCHAR2 DEFAULT NULL,
+                                    escape          IN BOOLEAN DEFAULT NULL,
+                                    query           IN OUT CLOB,
+                                    COL_LIST        OUT VARCHAR2) IS
+    --  THIS PROCEDURE IS COPYING FROM DBMS_CLOUD
+    -- NAME:
+    --   export_data_xform_query - Export Data Transform Query
+    --
+    -- DESCRIPTION:
+    --   This procedure transforms the query if necessary.
+    --   For JSON format type, it checks if the row produced by the query is
+    --   in JSON format. If it is not, then the query is transformed to use
+    --   JSON_OBJECT SQL function to produce rows in JSON format
+    --
+    -- PARAMETERS:
+    --  format_type      (IN)     - format type eg: JSON, CSV, TXT, XML
+    --
+    --  row_size         (IN)     - row size eg: SMALL(VARCHAR2) or LARGE(CLOB)
+    --
+    --  field_delimiter  (IN)     - field delimiter for csv
+    --
+    --  quote            (IN)     - quote character for CSV
+    --
+    --  end_quote        (IN)     - end quote for CSV
+    --
+    --  escape           (IN)     - escape for CSV
+    --
+    --  query            (IN OUT) - SELECT query to fetch the data to export
+    --
+    -- RETURNS:
+    --
+    -- NOTES:
+    --   Added by bug 32317812.
+    --
+    TYPE col_tab IS TABLE OF DBMS_ID;
+    l_col_arr   col_tab;
+    l_col_arr2  col_tab;
+    l_query     CLOB;
+    l_tmp_row   CLOB;
+    l_xform     BOOLEAN := FALSE;
+    l_json_obj  JSON_OBJECT_T;
+    l_xml_obj   XMLTYPE;
+    l_cur       INTEGER;
+    l_res       INTEGER;
+    l_ncols     INTEGER;
+    l_desc      DBMS_SQL.desc_tab2;
+    l_col_list  CLOB;
+    l_field_sep DBMS_ID;
+    l_trim_spec DBMS_ID;
+    l_col_spec  VARCHAR2(M_VCSIZ_4K);
+  BEGIN
+  
+    l_query := query;
+  
+    -- Find if the specified query produces a single column result
+    BEGIN
+      l_cur := DBMS_SQL.open_cursor;
+      DBMS_SQL.parse(l_cur, l_query, DBMS_SQL.native);
+      DBMS_SQL.describe_columns2(l_cur, l_ncols, l_desc);
+      IF l_ncols != 1 THEN
+        -- The query produces more than one column and hence the row
+        -- cannot be in required export format.
+        -- Transform the query to match the export format
+        l_xform := TRUE;
+      ELSE
+        BEGIN
+          DBMS_SQL.define_column(l_cur, 1, l_tmp_row);
+          l_res := DBMS_SQL.execute(l_cur);
+          IF DBMS_SQL.fetch_rows(l_cur) > 0 THEN
+            -- Fetch one row and check if the row is in required export format
+            DBMS_SQL.column_value(l_cur, 1, l_tmp_row);
+            CASE format_type
+              WHEN FORMAT_TYPE_JSON THEN
+                l_json_obj := JSON_OBJECT_T.parse(l_tmp_row);
+              WHEN FORMAT_TYPE_XML THEN
+                l_xml_obj := XMLTYPE(l_tmp_row);
+              WHEN FORMAT_TYPE_CSV THEN
+                -- always transform csv data
+                l_xform := TRUE;
+              ELSE
+                NULL;
+            END CASE;
+          END IF;
+        EXCEPTION
+          WHEN OTHERS THEN
+            -- Exception raised during fetching the row into a CLOB variable
+            -- or during parsing the fetched CLOB as a JSON object.
+            -- Transform the query
+            l_xform := TRUE;
+        END;
+      END IF;
+      DBMS_SQL.close_cursor(l_cur);
+    EXCEPTION
+      WHEN OTHERS THEN
+        DBMS_SQL.close_cursor(l_cur);
+    END;
+  
+    -- Transform the query if needed
+    IF l_xform THEN
+    
+      --
+      -- Check for duplicate column names
+      --
+      l_col_arr := col_tab();
+      l_col_arr.EXTEND(l_ncols);
+      FOR i IN 1 .. l_ncols LOOP
+        -- Save the column name in associated array
+        l_col_arr(i) := l_desc(i).col_name;
+      END LOOP;
+      l_col_arr2 := l_col_arr MULTISET INTERSECT DISTINCT l_col_arr;
+      IF l_ncols != l_col_arr2.COUNT THEN
+        -- Duplicate name found, print the list of duplicate column names
+        l_res := l_col_arr2.FIRST;
+        WHILE l_res IS NOT NULL LOOP
+          l_col_list := l_col_list ||
+                        DBMS_ASSERT.enquote_name(l_col_arr2(l_res)) || ', ';
+          l_res      := l_col_arr2.NEXT(l_res);
+        END LOOP;
+        raise_application_error(-20000,
+                                'Query contains duplicate column name - ' ||
+                                RTRIM(l_col_list, ','));
+      END IF;
+    
+      CASE format_type
+      -- JSON
+        WHEN FORMAT_TYPE_JSON THEN
+          IF row_size = 'SMALL' THEN
+            l_query := 'SELECT JSON_OBJECT(* RETURNING VARCHAR2(32767)) ';
+          ELSE
+            l_query := 'SELECT JSON_OBJECT(* RETURNING CLOB) ';
+          END IF;
+        
+      -- XML
+        WHEN FORMAT_TYPE_XML THEN
+          -- Create a csv list of double quoted column names
+          FOR i IN 1 .. l_ncols LOOP
+            l_col_list := l_col_list ||
+                          DBMS_ASSERT.enquote_name(l_desc(i).col_name) || ',';
+          END LOOP;
+          --l_query := 'SELECT XMLELEMENT("RECORD", XMLFOREST(' || RTRIM(l_col_list, ',') || ')) ';
+          l_query := 'SELECT XMLELEMENT("RECORD", XMLFOREST(' ||
+                     RTRIM(l_col_list, ',') || ')).getclobval() '; --BY DarkAthena 20211207
+      
+      -- CSV
+        WHEN FORMAT_TYPE_CSV THEN
+          l_field_sep := ' || ''' || field_delimiter || ''' || ';
+        
+          -- Trim Spaces specification
+          IF trim_spaces IS NOT NULL THEN
+            CASE trim_spaces
+              WHEN FORMAT_TRIM_LTRIM THEN
+                l_trim_spec := 'LTRIM(';
+              WHEN FORMAT_TRIM_RTRIM THEN
+                l_trim_spec := 'RTRIM(';
+              ELSE
+                l_trim_spec := 'TRIM(';
+            END CASE;
+          END IF;
+        
+          FOR i IN 1 .. l_ncols LOOP
+            -- Enquote column name
+            l_col_spec := DBMS_ASSERT.enquote_name(l_desc(i).col_name);
+          
+            -- Add special formatting for string column
+            IF l_desc(i)
+             .col_type IN
+                (1, 8, 9, 12, 69, 96, 112, 178, 180, 181, 182, 183, 231) THEN
+              -- Add Trim clause
+              IF l_trim_spec IS NOT NULL THEN
+                l_col_spec := l_trim_spec || l_col_spec || ')';
+              END IF;
+            
+              IF quote IS NOT NULL THEN
+                -- Add Escape
+                --  * REPLACE(col, '\', '\\')
+                --  * REPLACE(..., 'quote', '\quote')
+                --  * REPLACE(..., 'endquote', '\endquote')
+                IF escape IS NOT NULL THEN
+                  l_col_spec := 'REPLACE(REPLACE(' || l_col_spec ||
+                                ', ''\'', ''\\''), ''' || quote ||
+                                ''', ''\' || quote || ''')';
+                  IF end_quote IS NOT NULL THEN
+                    l_col_spec := 'REPLACE(' || l_col_spec || ', ''' ||
+                                  end_quote || ''', ''\' || end_quote ||
+                                  ''')';
+                  END IF;
+                END IF;
+              
+                -- Add Quote and End Quote
+                l_col_spec := '''' || quote || ''' || ' || l_col_spec ||
+                              ' || ''' || NVL(end_quote, quote) || '''';
+              END IF;
+            END IF;
+          
+            -- Add Field Delimiter at the end
+            IF LENGTH(l_col_list) > 0 THEN
+              l_col_list := l_col_list || l_field_sep || l_col_spec;
+            ELSE
+              l_col_list := l_col_spec;
+            END IF;
+          END LOOP;
+          COL_LIST := l_col_list;
+          -- Construct the query, trim off field delimiter at the end
+          l_query := 'SELECT ' || l_col_list || ' ';
+        
+      -- Other text formats
+        ELSE
+          -- Generic text formats do not support transforming the query
+          raise_application_error(-20000,
+                                  'Query should contain only one column for ' ||
+                                  format_type || ' export');
+      END CASE;
+    
+      -- Add the FROM clause
+      l_query := l_query || 'FROM (' || query || ')';
+    
+    END IF;
+  
+    query := l_query;
+  
+  END export_data_xform_query;
+
+  FUNCTION GET_DATA(i_sql           clob,
+                    format          varchar2 default FORMAT_TYPE_CSV,
+                    field_delimiter VARCHAR2 DEFAULT ',',
+                    skip_header     varchar2 default 'Y') RETURN OUT_DATA
+    PIPELINED
+  --PARALLEL_ENABLE(PARTITION refcursor BY ANY) 
+   IS
+    A_SQL      CLOB;
+    OUT_STR    VARCHAR2(M_VCSIZ_32K);
+    v_cur      sys_refcursor;
+    l_col_list VARCHAR2(M_VCSIZ_32K);
+  BEGIN
+    IF UPPER(format) NOT IN (FORMAT_TYPE_CSV,
+                             FORMAT_TYPE_JSON,
+                             FORMAT_TYPE_TEXT,
+                             FORMAT_TYPE_XML) THEN
+      RAISE invalid_format_value;
+    END IF;
+    A_SQL := convert_sql(i_sql);
+    DBMS_OUTPUT.put_line(A_SQL);
+    export_data_xform_query(format_type     => format,
+                            field_delimiter => field_delimiter,
+                            query           => A_SQL,
+                            COL_LIST        => L_col_list);
+    IF skip_header = 'N' AND format = FORMAT_TYPE_CSV THEN
+      EXECUTE IMMEDIATE 'SELECT ' || REPLACE(L_col_list, '"', '''') ||
+                        ' FROM DUAL'
+        INTO L_col_list;
+      PIPE ROW(L_col_list);
+    END IF;
+    OPEN v_cur FOR A_SQL;
+    LOOP
+      FETCH v_cur
+        INTO OUT_STR;
+      EXIT WHEN v_cur%NOTFOUND;
+      PIPE ROW(OUT_STR);
+    END LOOP;
+    CLOSE v_cur;
+    RETURN;
+  END;
+
+end pivot_ext_pkg;
+/
