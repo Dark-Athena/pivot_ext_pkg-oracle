@@ -151,6 +151,10 @@ create or replace package body pivot_ext_pkg is
         into l_in_str;
       l_out_sql := replace(l_main_Sql, l_pivot_in_sql(i), l_in_str);
     end loop;
+    --add no " FOR " sql , 2022-10-20
+    IF l_out_sql IS NULL THEN 
+      l_out_sql:=l_main_Sql;
+      END IF;
     return l_out_sql;
   end;
   function get_cursor(i_sql clob) return ref_cur is
